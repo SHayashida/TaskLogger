@@ -1,0 +1,8 @@
+# ビルド成果物
+*.exe
+*.pdb
+# 個人の作業ログ（絶対にコミットしない）
+logs/
+*.csv
+summary_*.html
+error.log
