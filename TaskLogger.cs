@@ -156,7 +156,12 @@ namespace TaskLogger
         readonly ToolStripMenuItem pauseItem;
         readonly ToolStripMenuItem autoStartItem;
         readonly System.Windows.Forms.Timer refreshTimer;
+        readonly System.Windows.Forms.Timer watchdogTimer;
         readonly MouseHook hook;
+        NativeMethods.POINT lastCursor;
+        bool haveCursor;
+        int lastCheckTick;
+        public const string Version = "1.2";
         readonly ClickRecorder recorder;
         Icon activeIcon, pausedIcon;
 
@@ -167,6 +172,8 @@ namespace TaskLogger
         {
             this.config = config;
             Directory.CreateDirectory(config.LogDir);
+            SystemLog.Dir = config.LogDir;
+            SystemLog.Write("起動 (v" + Version + ")");
 
             recorder = new ClickRecorder(config);
             hook = new MouseHook(config.RecordRightClick, recorder.Enqueue);
@@ -200,11 +207,84 @@ namespace TaskLogger
             refreshTimer.Tick += delegate { RefreshTooltip(); recorder.FlushPending(); };
             refreshTimer.Start();
 
-            if (!hook.Install())
+            if (!hook.Start())
             {
+                SystemLog.Write("マウスの監視を開始できませんでした");
                 MessageBox.Show("マウスの監視を開始できませんでした。", "TaskLogger", MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
+
+            // 見張り役: フックやクリック処理が止まっていないかを10秒ごとに確認する
+            watchdogTimer = new System.Windows.Forms.Timer();
+            watchdogTimer.Interval = 10000;
+            watchdogTimer.Tick += delegate { Watchdog(); };
+            watchdogTimer.Start();
+
+            // スリープ・ロック・サインアウトへの対応
+            SystemEvents.PowerModeChanged += OnPowerModeChanged;
+            SystemEvents.SessionSwitch += OnSessionSwitch;
+            SystemEvents.SessionEnding += OnSessionEnding;
+
             tray.ShowBalloonTip(2000, "TaskLogger", "作業の記録を開始しました。", ToolTipIcon.Info);
+        }
+
+        void Watchdog()
+        {
+            try
+            {
+                // マウスが動いたのにフックに何も届いていなければ、フックが外れている
+                NativeMethods.POINT p;
+                int now = Environment.TickCount;
+                if (NativeMethods.GetCursorPos(out p))
+                {
+                    if (haveCursor && (p.X != lastCursor.X || p.Y != lastCursor.Y)
+                        && unchecked(hook.LastCallbackTick - lastCheckTick) < 0)
+                    {
+                        bool ok = hook.Restart();
+                        SystemLog.Write("マウスの動きが届いていなかったため、監視を付け直しました" + (ok ? "" : "（失敗）"));
+                    }
+                    lastCursor = p;
+                    haveCursor = true;
+                }
+                else haveCursor = false;   // ロック画面など
+                lastCheckTick = now;
+
+                recorder.CheckWorker(30);
+            }
+            catch (Exception ex) { SystemLog.Write("見張り処理でエラー: " + ex.Message); }
+        }
+
+        void OnPowerModeChanged(object sender, PowerModeChangedEventArgs e)
+        {
+            if (e.Mode == PowerModes.Suspend)
+            {
+                SystemLog.Write("スリープに入ります");
+                recorder.FlushPending(true);
+            }
+            else if (e.Mode == PowerModes.Resume)
+            {
+                recorder.ResetCaches();
+                bool ok = hook.Restart();
+                haveCursor = false;
+                SystemLog.Write("スリープから復帰しました。監視を付け直しました" + (ok ? "" : "（失敗）"));
+            }
+        }
+
+        void OnSessionSwitch(object sender, SessionSwitchEventArgs e)
+        {
+            if (e.Reason == SessionSwitchReason.SessionLock) SystemLog.Write("画面ロック");
+            else if (e.Reason == SessionSwitchReason.SessionUnlock)
+            {
+                recorder.ResetCaches();
+                bool ok = hook.Restart();
+                haveCursor = false;
+                SystemLog.Write("ロック解除。監視を付け直しました" + (ok ? "" : "（失敗）"));
+            }
+        }
+
+        void OnSessionEnding(object sender, SessionEndingEventArgs e)
+        {
+            SystemLog.Write("サインアウト/シャットダウン");
+            recorder.FlushPending(true);
         }
 
         void TogglePause()
@@ -218,7 +298,10 @@ namespace TaskLogger
         void RefreshTooltip()
         {
             string state = recorder.Paused ? "一時停止中" : "記録中";
-            string text = "TaskLogger - " + state + " (今日 " + recorder.TodayCount + " 件)";
+            string text = "TaskLogger - " + state + " (今日 " + recorder.TodayCount + " 件";
+            DateTime last = recorder.LastRecordTime;
+            if (last.Date == DateTime.Today) text += " / 最終 " + last.ToString("HH:mm");
+            text += ")";
             if (text.Length > 63) text = text.Substring(0, 63);
             tray.Text = text;
         }
@@ -226,7 +309,12 @@ namespace TaskLogger
         void ShowSummary()
         {
             recorder.FlushPending();
-            Summary.OpenFor(config, DateTime.Today);
+            // サマリー作成は時間がかかることがあるので、別スレッドで行う
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                try { Summary.OpenFor(config, DateTime.Today); }
+                catch (Exception ex) { SystemLog.Write("サマリー作成でエラー: " + ex.Message); }
+            });
         }
 
         void OpenTodayCsv()
@@ -271,8 +359,13 @@ namespace TaskLogger
         void ExitApp()
         {
             refreshTimer.Stop();
-            hook.Uninstall();
+            watchdogTimer.Stop();
+            SystemEvents.PowerModeChanged -= OnPowerModeChanged;
+            SystemEvents.SessionSwitch -= OnSessionSwitch;
+            SystemEvents.SessionEnding -= OnSessionEnding;
+            hook.Stop();
             recorder.Stop();
+            SystemLog.Write("終了");
             tray.Visible = false;
             tray.Dispose();
             ExitThread();
@@ -311,17 +404,23 @@ namespace TaskLogger
         public string Button;
     }
 
+    // フックは専用スレッドで動かす。UIの処理(サマリー作成など)で応答が遅れると、
+    // Windows はフックを黙って外してしまうため。外れても Restart() で付け直せる。
     class MouseHook
     {
         const int WH_MOUSE_LL = 14;
         const int WM_LBUTTONDOWN = 0x0201;
         const int WM_RBUTTONDOWN = 0x0204;
+        const uint WM_QUIT = 0x0012;
         const uint GA_ROOT = 2;
 
         readonly bool includeRight;
         readonly Action<ClickEvent> onClick;
-        NativeMethods.LowLevelMouseProc proc;  // GCで回収されないよう保持
-        IntPtr hookId = IntPtr.Zero;
+        readonly object sync = new object();
+        Thread thread;
+        uint threadId;
+        volatile int lastCallbackTick = Environment.TickCount;
+        public int RestartCount;
 
         public MouseHook(bool includeRight, Action<ClickEvent> onClick)
         {
@@ -329,41 +428,112 @@ namespace TaskLogger
             this.onClick = onClick;
         }
 
-        public bool Install()
-        {
-            proc = HookCallback;
-            hookId = NativeMethods.SetWindowsHookEx(WH_MOUSE_LL, proc, NativeMethods.GetModuleHandle(null), 0);
-            return hookId != IntPtr.Zero;
-        }
+        // 最後にマウスの動き・クリックを受け取った時刻 (Environment.TickCount)
+        public int LastCallbackTick { get { return lastCallbackTick; } }
 
-        public void Uninstall()
+        public bool Start()
         {
-            if (hookId != IntPtr.Zero) { NativeMethods.UnhookWindowsHookEx(hookId); hookId = IntPtr.Zero; }
-        }
-
-        IntPtr HookCallback(int nCode, IntPtr wParam, IntPtr lParam)
-        {
-            if (nCode >= 0)
+            lock (sync)
             {
-                int msg = wParam.ToInt32();
-                if (msg == WM_LBUTTONDOWN || (includeRight && msg == WM_RBUTTONDOWN))
+                ManualResetEvent ready = new ManualResetEvent(false);
+                bool ok = false;
+                Thread t = new Thread(delegate()
                 {
-                    try
+                    NativeMethods.LowLevelMouseProc proc = null;
+                    IntPtr hookId = IntPtr.Zero;
+                    proc = delegate(int nCode, IntPtr wParam, IntPtr lParam)
                     {
-                        NativeMethods.MSLLHOOKSTRUCT info = (NativeMethods.MSLLHOOKSTRUCT)Marshal.PtrToStructure(lParam, typeof(NativeMethods.MSLLHOOKSTRUCT));
-                        IntPtr w = NativeMethods.WindowFromPoint(info.pt);
-                        ClickEvent ev = new ClickEvent();
-                        ev.Time = DateTime.Now;
-                        ev.X = info.pt.X;
-                        ev.Y = info.pt.Y;
-                        ev.RootHwnd = w == IntPtr.Zero ? IntPtr.Zero : NativeMethods.GetAncestor(w, GA_ROOT);
-                        ev.Button = msg == WM_LBUTTONDOWN ? "左" : "右";
-                        onClick(ev);
-                    }
-                    catch { }
-                }
+                        if (nCode >= 0) Callback(wParam, lParam);
+                        return NativeMethods.CallNextHookEx(hookId, nCode, wParam, lParam);
+                    };
+                    threadId = NativeMethods.GetCurrentThreadId();
+                    hookId = NativeMethods.SetWindowsHookEx(WH_MOUSE_LL, proc, NativeMethods.GetModuleHandle(null), 0);
+                    ok = hookId != IntPtr.Zero;
+                    lastCallbackTick = Environment.TickCount;
+                    ready.Set();
+                    if (!ok) return;
+                    NativeMethods.MSG msg;
+                    while (NativeMethods.GetMessage(out msg, IntPtr.Zero, 0, 0) > 0) { }
+                    NativeMethods.UnhookWindowsHookEx(hookId);
+                    GC.KeepAlive(proc);
+                });
+                t.IsBackground = true;
+                t.Priority = ThreadPriority.Highest;
+                t.SetApartmentState(ApartmentState.STA);
+                t.Start();
+                ready.WaitOne(5000);
+                thread = t;
+                return ok;
             }
-            return NativeMethods.CallNextHookEx(hookId, nCode, wParam, lParam);
+        }
+
+        public void Stop()
+        {
+            lock (sync)
+            {
+                if (thread == null) return;
+                NativeMethods.PostThreadMessage(threadId, WM_QUIT, IntPtr.Zero, IntPtr.Zero);
+                thread.Join(1000);
+                thread = null;
+            }
+        }
+
+        // フックを作り直す(スリープ復帰時や、反応がなくなった時)
+        public bool Restart()
+        {
+            Stop();
+            RestartCount++;
+            return Start();
+        }
+
+        void Callback(IntPtr wParam, IntPtr lParam)
+        {
+            lastCallbackTick = Environment.TickCount;   // マウス移動も含めて「生きている」印
+            int msg = wParam.ToInt32();
+            if (msg != WM_LBUTTONDOWN && !(includeRight && msg == WM_RBUTTONDOWN)) return;
+            try
+            {
+                NativeMethods.MSLLHOOKSTRUCT info = (NativeMethods.MSLLHOOKSTRUCT)Marshal.PtrToStructure(lParam, typeof(NativeMethods.MSLLHOOKSTRUCT));
+                IntPtr w = NativeMethods.WindowFromPoint(info.pt);
+                ClickEvent ev = new ClickEvent();
+                ev.Time = DateTime.Now;
+                ev.X = info.pt.X;
+                ev.Y = info.pt.Y;
+                ev.RootHwnd = w == IntPtr.Zero ? IntPtr.Zero : NativeMethods.GetAncestor(w, GA_ROOT);
+                ev.Button = msg == WM_LBUTTONDOWN ? "左" : "右";
+                onClick(ev);
+            }
+            catch { }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // 動作ログ (logs\system.log) ― 記録が止まった時の原因調査用
+    // ------------------------------------------------------------------
+    static class SystemLog
+    {
+        static readonly object sync = new object();
+        public static string Dir;
+
+        public static void Write(string message)
+        {
+            if (Dir == null) return;
+            lock (sync)
+            {
+                try
+                {
+                    string path = Path.Combine(Dir, "system.log");
+                    FileInfo fi = new FileInfo(path);
+                    if (fi.Exists && fi.Length > 1024 * 1024)
+                    {
+                        string old = Path.Combine(Dir, "system.old.log");
+                        if (File.Exists(old)) File.Delete(old);
+                        File.Move(path, old);
+                    }
+                    File.AppendAllText(path, DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + " " + message + "\r\n", Encoding.UTF8);
+                }
+                catch { }
+            }
         }
     }
 
@@ -374,7 +544,14 @@ namespace TaskLogger
     {
         readonly Config config;
         readonly BlockingCollection<ClickEvent> queue = new BlockingCollection<ClickEvent>(200);
-        readonly Thread worker;
+        readonly object stateLock = new object();   // キャッシュ・重複判定・書き込みの保護
+        int generation;                              // ワーカーを作り直した時に古いものを止めるための番号
+        volatile bool busy;
+        volatile int busySinceTick;
+        int dropped;
+        DateTime lastRecordTime = DateTime.MinValue;
+        int firstWriteFailTick;
+        bool sidecarNotified;
         readonly int ownPid = System.Diagnostics.Process.GetCurrentProcess().Id;
         readonly Dictionary<uint, string> procNameCache = new Dictionary<uint, string>();
         readonly Dictionary<IntPtr, KeyValuePair<string, string>> urlCache = new Dictionary<IntPtr, KeyValuePair<string, string>>();
@@ -414,12 +591,43 @@ namespace TaskLogger
         {
             this.config = config;
             todayCount = CountExistingLines(CsvPathFor(config, DateTime.Today));
-            worker = new Thread(WorkerLoop);
-            worker.IsBackground = true;
-            worker.SetApartmentState(ApartmentState.MTA); // UI Automation は MTA スレッドから呼ぶ
-            worker.Priority = ThreadPriority.BelowNormal;
-            worker.Start();
+            StartWorker();
         }
+
+        void StartWorker()
+        {
+            int gen = Interlocked.Increment(ref generation);
+            busy = false;
+            Thread t = new Thread(delegate() { WorkerLoop(gen); });
+            t.IsBackground = true;
+            t.SetApartmentState(ApartmentState.MTA); // UI Automation は MTA スレッドから呼ぶ
+            t.Priority = ThreadPriority.BelowNormal;
+            t.Start();
+        }
+
+        // 応答しないアプリへの問い合わせで処理が止まっていたら、新しいワーカーに切り替える
+        public void CheckWorker(int stuckSeconds)
+        {
+            if (busy && unchecked(Environment.TickCount - busySinceTick) > stuckSeconds * 1000)
+            {
+                SystemLog.Write("クリック処理が " + stuckSeconds + " 秒以上止まっていたため、処理スレッドを作り直しました");
+                StartWorker();
+            }
+            int d = Interlocked.Exchange(ref dropped, 0);
+            if (d > 0) SystemLog.Write("処理が追いつかず " + d + " 件のクリックを記録できませんでした");
+        }
+
+        // スリープ復帰後などに、古いウィンドウ情報を捨てる
+        public void ResetCaches()
+        {
+            lock (stateLock)
+            {
+                procNameCache.Clear(); descCache.Clear(); urlCache.Clear();
+                lastKey = null;
+            }
+        }
+
+        public DateTime LastRecordTime { get { return lastRecordTime; } }
 
         public bool Paused { get { return paused; } set { paused = value; } }
 
@@ -431,22 +639,31 @@ namespace TaskLogger
         public void Enqueue(ClickEvent ev)
         {
             if (paused) return;
-            queue.TryAdd(ev); // 処理が詰まっている時は捨てる(フックを遅らせない)
+            if (!queue.TryAdd(ev)) Interlocked.Increment(ref dropped); // 処理が詰まっている時は捨てる(フックを遅らせない)
         }
 
         public void Stop()
         {
             queue.CompleteAdding();
-            worker.Join(2000);
-            FlushPending();
+            for (int i = 0; i < 20 && queue.Count > 0; i++) Thread.Sleep(100);
+            FlushPending(true);
         }
 
-        void WorkerLoop()
+        void WorkerLoop(int gen)
         {
-            foreach (ClickEvent ev in queue.GetConsumingEnumerable())
+            while (gen == generation)
             {
+                ClickEvent ev;
+                try
+                {
+                    if (!queue.TryTake(out ev, 1000)) { if (queue.IsCompleted) return; continue; }
+                }
+                catch (InvalidOperationException) { return; }   // 終了処理中 (ObjectDisposedException も含む)
+                busySinceTick = Environment.TickCount;
+                busy = true;
                 try { HandleClick(ev); }
                 catch (Exception ex) { ErrorLog(ex); }
+                finally { if (gen == generation) busy = false; }
             }
         }
 
@@ -458,7 +675,8 @@ namespace TaskLogger
             NativeMethods.GetWindowThreadProcessId(ev.RootHwnd, out pid);
             if (pid == 0 || pid == (uint)ownPid) return;
 
-            string procName = GetProcessName(pid);
+            string procName;
+            lock (stateLock) procName = GetProcessName(pid);
             if (procName.Length == 0) return;
             foreach (string ex in config.ExcludeProcesses)
                 if (ex.Equals(procName, StringComparison.OrdinalIgnoreCase)) return;
@@ -469,7 +687,8 @@ namespace TaskLogger
             foreach (string kw in config.PrivateKeywords)
                 if (kw.Length > 0 && title.IndexOf(kw, StringComparison.OrdinalIgnoreCase) >= 0) return;
 
-            string tool = FriendlyName(procName, pid);
+            string tool;
+            lock (stateLock) tool = FriendlyName(procName, pid);
             if (procName.Equals("explorer", StringComparison.OrdinalIgnoreCase))
             {
                 if (cls == "Shell_TrayWnd" || cls == "Shell_SecondaryTrayWnd") tool = "タスクバー";
@@ -486,20 +705,23 @@ namespace TaskLogger
             if (config.CaptureElement && (!isBrowser || config.CaptureElementInBrowser))
                 GetElementAt(ev.X, ev.Y, out elemName, out elemType);
 
-            // ダブルクリック等の連続した同一クリックはまとめる
-            string key = ev.RootHwnd.ToInt64() + "|" + title + "|" + elemName;
-            if (key == lastKey && (ev.Time - lastTime).TotalSeconds < config.DedupSeconds)
-            {
-                lastTime = ev.Time;
-                return;
-            }
-            lastKey = key;
-            lastTime = ev.Time;
-
             string[] fields = {
                 ev.Time.ToString("yyyy-MM-dd HH:mm:ss"), tool, work, url, elemName, elemType, ev.Button, procName
             };
-            Write(ev.Time.Date, Csv.Line(fields));
+            lock (stateLock)
+            {
+                // ダブルクリック等の連続した同一クリックはまとめる
+                string key = ev.RootHwnd.ToInt64() + "|" + title + "|" + elemName;
+                if (key == lastKey && (ev.Time - lastTime).TotalSeconds < config.DedupSeconds)
+                {
+                    lastTime = ev.Time;
+                    return;
+                }
+                lastKey = key;
+                lastTime = ev.Time;
+                lastRecordTime = ev.Time;
+                Write(ev.Time.Date, Csv.Line(fields));
+            }
         }
 
         // ---------- 書き込み ----------
@@ -520,8 +742,17 @@ namespace TaskLogger
             }
         }
 
-        // ExcelでCSVを開いていてロックされていても、記録は失わずに後で書き込む
-        public void FlushPending()
+        // 本体のCSVがExcelで開かれていて書けない間の退避先 (例: 2026-11-18.pending.csv)
+        public static string SidecarPathFor(string csvPath)
+        {
+            return Path.Combine(Path.GetDirectoryName(csvPath), Path.GetFileNameWithoutExtension(csvPath) + ".pending.csv");
+        }
+
+        // CSVがロックされていても記録は失わない:
+        //   まずメモリに保持 → 60秒以上書けなければ退避ファイルへ → 書けるようになったら本体へ戻す
+        public void FlushPending() { FlushPending(false); }
+
+        public void FlushPending(bool force)
         {
             lock (pendingLock)
             {
@@ -531,23 +762,65 @@ namespace TaskLogger
                     StringBuilder sb = new StringBuilder();
                     int n = 0;
                     while (n < pending.Count && pending[n].Key == path) { sb.Append(pending[n].Value).Append("\r\n"); n++; }
-                    try
+
+                    if (TryAppend(path, sb.ToString(), true))
                     {
-                        Directory.CreateDirectory(Path.GetDirectoryName(path));
-                        bool isNew = !File.Exists(path);
-                        // BOM付きUTF-8: Excelでそのまま開いても文字化けしない
-                        using (StreamWriter w = new StreamWriter(path, true, new UTF8Encoding(isNew)))
-                        {
-                            if (isNew) w.Write(Csv.Line(Header) + "\r\n");
-                            w.Write(sb.ToString());
-                        }
                         pending.RemoveRange(0, n);
+                        firstWriteFailTick = 0;
+                        continue;
                     }
-                    catch (IOException) { break; }
-                    catch (UnauthorizedAccessException) { break; }
+                    if (firstWriteFailTick == 0) firstWriteFailTick = Environment.TickCount;
+                    if (force || unchecked(Environment.TickCount - firstWriteFailTick) > 60000)
+                    {
+                        if (TryAppend(SidecarPathFor(path), sb.ToString(), false))
+                        {
+                            pending.RemoveRange(0, n);
+                            if (!sidecarNotified)
+                            {
+                                SystemLog.Write(Path.GetFileName(path) + " に書き込めないため(Excelで開いている等) " + Path.GetFileName(SidecarPathFor(path)) + " に退避しました");
+                                sidecarNotified = true;
+                            }
+                            continue;
+                        }
+                    }
+                    break;
                 }
-                if (pending.Count > 5000) pending.RemoveRange(0, pending.Count - 5000);
+                if (pending.Count > 20000) pending.RemoveRange(0, pending.Count - 20000);
             }
+        }
+
+        static bool TryAppend(string path, string text, bool mergeSidecar)
+        {
+            try
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(path));
+                bool isNew = !File.Exists(path);
+                // BOM付きUTF-8: Excelでそのまま開いても文字化けしない
+                using (StreamWriter w = new StreamWriter(path, true, new UTF8Encoding(isNew)))
+                {
+                    if (isNew) w.Write(Csv.Line(Header) + "\r\n");
+                    string side = mergeSidecar ? SidecarPathFor(path) : null;
+                    if (side != null && File.Exists(side))
+                    {
+                        // 退避していた分を先に本体へ戻す
+                        string[] lines = File.ReadAllLines(side, Encoding.UTF8);
+                        StringBuilder sb = new StringBuilder();
+                        for (int i = 0; i < lines.Length; i++)
+                        {
+                            if (i == 0 && lines[i].StartsWith(Header[0])) continue;
+                            if (lines[i].Length > 0) sb.Append(lines[i]).Append("\r\n");
+                        }
+                        w.Write(sb.ToString());
+                        w.Flush();
+                        File.Delete(side);
+                        SystemLog.Write(Path.GetFileName(side) + " の内容を " + Path.GetFileName(path) + " に戻しました");
+                    }
+                    w.Write(text);
+                }
+                return true;
+            }
+            catch (IOException) { return false; }
+            catch (UnauthorizedAccessException) { return false; }
         }
 
         static int CountExistingLines(string path)
@@ -684,17 +957,14 @@ namespace TaskLogger
         {
             // タイトルが同じ間はキャッシュを使う(UI Automation の呼び出しを最小限にする)
             KeyValuePair<string, string> cached;
-            if (urlCache.TryGetValue(hwnd, out cached) && cached.Key == title) return cached.Value;
+            lock (stateLock)
+                if (urlCache.TryGetValue(hwnd, out cached) && cached.Key == title) return cached.Value;
 
             string url = "";
             try
             {
                 AutomationElement root = AutomationElement.FromHandle(hwnd);
-                AutomationElement edit = null;
-                if (procName.Equals("firefox", StringComparison.OrdinalIgnoreCase))
-                    edit = root.FindFirst(TreeScope.Descendants, new PropertyCondition(AutomationElement.AutomationIdProperty, "urlbar-input"));
-                if (edit == null)
-                    edit = root.FindFirst(TreeScope.Descendants, new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Edit));
+                AutomationElement edit = FindAddressBar(root, procName);
                 if (edit != null)
                 {
                     object pat;
@@ -704,10 +974,68 @@ namespace TaskLogger
             }
             catch { }
 
-            url = FormatUrl(Clean(url), config.UrlDetail);
-            if (urlCache.Count > 100) urlCache.Clear();
-            urlCache[hwnd] = new KeyValuePair<string, string>(title, url);
+            // アドレスバー以外(ページ内の入力欄など)の値を拾わないよう、URLの形をしたものだけ残す
+            url = Clean(url);
+            if (!LooksLikeUrl(url)) url = "";
+            url = FormatUrl(url, config.UrlDetail);
+            lock (stateLock)
+            {
+                if (urlCache.Count > 100) urlCache.Clear();
+                urlCache[hwnd] = new KeyValuePair<string, string>(title, url);
+            }
             return url;
+        }
+
+        // アドレスバーの名前 (Chrome / Edge / Brave など。日本語・英語)
+        static readonly string[] AddressBarNames = { "アドレス検索バー", "アドレスと検索バー", "Address and search bar", "Search or enter address", "Search or enter web address" };
+
+        static AutomationElement FindAddressBar(AutomationElement root, string procName)
+        {
+            if (procName.Equals("firefox", StringComparison.OrdinalIgnoreCase))
+            {
+                AutomationElement ff = root.FindFirst(TreeScope.Descendants, new PropertyCondition(AutomationElement.AutomationIdProperty, "urlbar-input"));
+                if (ff != null) return ff;
+            }
+            // 1) 名前で探す (ページ内の入力欄を拾わない)。
+            //    Chrome は版によってアドレスバーが「編集」だったり「コンボ ボックス」だったりするので種類は問わない
+            Condition[] names = new Condition[AddressBarNames.Length];
+            for (int i = 0; i < names.Length; i++) names[i] = new PropertyCondition(AutomationElement.NameProperty, AddressBarNames[i]);
+            AutomationElement byName = root.FindFirst(TreeScope.Descendants, new OrCondition(names));
+            if (byName != null)
+            {
+                object pat;
+                if (byName.TryGetCurrentPattern(ValuePattern.Pattern, out pat)) return byName;
+                AutomationElement inner = byName.FindFirst(TreeScope.Descendants, new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Edit));
+                if (inner != null) return inner;
+            }
+
+            // 2) 見つからなければ、ページ本体(Document)の中には入らずにツールバーの入力欄を探す
+            TreeWalker walker = TreeWalker.ControlViewWalker;
+            Queue<AutomationElement> q = new Queue<AutomationElement>();
+            q.Enqueue(root);
+            int visited = 0;
+            while (q.Count > 0 && visited < 300)
+            {
+                AutomationElement child = walker.GetFirstChild(q.Dequeue());
+                while (child != null && visited < 300)
+                {
+                    visited++;
+                    ControlType ct = child.Current.ControlType;
+                    if (ct == ControlType.Edit || ct == ControlType.ComboBox) return child;
+                    if (ct != ControlType.Document) q.Enqueue(child);
+                    child = walker.GetNextSibling(child);
+                }
+            }
+            return null;
+        }
+
+        static readonly Regex UrlShape = new Regex(
+            @"^(?:[a-z][a-z0-9+.\-]*://\S+|(?:[a-z0-9-]+\.)+[a-z]{2,}(?::\d+)?(?:[/?#]\S*)?|localhost(?::\d+)?(?:[/?#]\S*)?|\d{1,3}(?:\.\d{1,3}){3}(?::\d+)?(?:[/?#]\S*)?|[a-z]:[/\\]\S*|(?:chrome|edge|about|file):\S*)$",
+            RegexOptions.IgnoreCase);
+
+        public static bool LooksLikeUrl(string s)
+        {
+            return s.Length > 0 && s.IndexOf(' ') < 0 && UrlShape.IsMatch(s);
         }
 
         public static string FormatUrl(string url, string detail)
@@ -733,6 +1061,30 @@ namespace TaskLogger
     // ------------------------------------------------------------------
     static class Csv
     {
+        // ExcelでShift_JISとして保存し直されたファイルや、その後に追記されて混ざったファイルも読めるよう、
+        // 行ごとにUTF-8かShift_JISかを判定して読む
+        public static string DecodeMixed(byte[] bytes)
+        {
+            int start = (bytes.Length >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF) ? 3 : 0;
+            UTF8Encoding strict = new UTF8Encoding(false, true);
+            Encoding sjis = null;
+            try { sjis = Encoding.GetEncoding(932); } catch { }
+            StringBuilder sb = new StringBuilder(bytes.Length);
+            int i = start;
+            while (i < bytes.Length)
+            {
+                int nl = Array.IndexOf(bytes, (byte)0x0A, i);
+                int end = nl < 0 ? bytes.Length : nl + 1;
+                try { sb.Append(strict.GetString(bytes, i, end - i)); }
+                catch (DecoderFallbackException)
+                {
+                    sb.Append(sjis != null ? sjis.GetString(bytes, i, end - i) : Encoding.UTF8.GetString(bytes, i, end - i));
+                }
+                i = end;
+            }
+            return sb.ToString();
+        }
+
         public static string Line(string[] fields)
         {
             StringBuilder sb = new StringBuilder();
@@ -748,10 +1100,14 @@ namespace TaskLogger
 
         public static List<string[]> ReadRows(string path)
         {
-            string text;
+            byte[] bytes;
             using (FileStream fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
-            using (StreamReader r = new StreamReader(fs, Encoding.UTF8, true))
-                text = r.ReadToEnd();
+            using (MemoryStream ms = new MemoryStream())
+            {
+                fs.CopyTo(ms);
+                bytes = ms.ToArray();
+            }
+            string text = DecodeMixed(bytes);
 
             List<string[]> rows = new List<string[]>();
             List<string> cur = new List<string>();
@@ -1011,7 +1367,7 @@ namespace TaskLogger
         public static void OpenFor(Config config, DateTime day)
         {
             string csv = ClickRecorder.CsvPathFor(config, day);
-            if (!File.Exists(csv))
+            if (!File.Exists(csv) && !File.Exists(ClickRecorder.SidecarPathFor(csv)))
             {
                 MessageBox.Show(day.ToString("yyyy-MM-dd") + " の記録はありません。", "TaskLogger");
                 return;
@@ -1022,16 +1378,29 @@ namespace TaskLogger
             try { Process.Start(outPath); } catch (Exception ex) { MessageBox.Show(ex.Message, "TaskLogger"); }
         }
 
+        // Excelで保存し直すと「2026/11/18 14:58」のような形式になるため、どちらも読めるようにする
+        static readonly string[] TimeFormats = {
+            "yyyy-MM-dd HH:mm:ss", "yyyy-MM-dd H:mm:ss", "yyyy-MM-dd H:mm",
+            "yyyy/MM/dd HH:mm:ss", "yyyy/M/d H:mm:ss", "yyyy/MM/dd H:mm", "yyyy/M/d H:mm" };
+
+        public static bool TryParseTime(string s, out DateTime t)
+        {
+            return DateTime.TryParseExact((s ?? "").Trim(), TimeFormats, CultureInfo.InvariantCulture, DateTimeStyles.None, out t);
+        }
+
         public static List<Rec> Load(string csv)
         {
             List<Rec> list = new List<Rec>();
-            List<string[]> rows = Csv.ReadRows(csv);
-            for (int i = 1; i < rows.Count; i++)
+            List<string[]> rows = new List<string[]>();
+            if (File.Exists(csv)) rows.AddRange(Csv.ReadRows(csv));
+            string side = ClickRecorder.SidecarPathFor(csv);   // Excelで開いている間に退避した分
+            if (File.Exists(side)) rows.AddRange(Csv.ReadRows(side));
+            for (int i = 0; i < rows.Count; i++)
             {
                 string[] r = rows[i];
                 if (r.Length < 5) continue;
                 DateTime t;
-                if (!DateTime.TryParseExact(r[0], "yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture, DateTimeStyles.None, out t)) continue;
+                if (!TryParseTime(r[0], out t)) continue;   // 見出し行やメモ行は飛ばす
                 Rec rec = new Rec();
                 rec.Time = t; rec.Tool = r[1]; rec.Work = r[2].Length > 0 ? r[2] : MeetingDetector.NoTitle; rec.Url = r[3]; rec.Target = r[4];
                 rec.TargetType = r.Length > 5 ? r[5] : "";
@@ -1282,5 +1651,25 @@ namespace TaskLogger
         public static extern bool SetProcessDpiAwarenessContext(IntPtr value);
         [DllImport("user32.dll")]
         public static extern bool DestroyIcon(IntPtr hIcon);
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct MSG
+        {
+            public IntPtr hwnd;
+            public uint message;
+            public IntPtr wParam;
+            public IntPtr lParam;
+            public uint time;
+            public POINT pt;
+        }
+
+        [DllImport("user32.dll")]
+        public static extern int GetMessage(out MSG lpMsg, IntPtr hWnd, uint wMsgFilterMin, uint wMsgFilterMax);
+        [DllImport("user32.dll", SetLastError = true)]
+        public static extern bool PostThreadMessage(uint idThread, uint msg, IntPtr wParam, IntPtr lParam);
+        [DllImport("kernel32.dll")]
+        public static extern uint GetCurrentThreadId();
+        [DllImport("user32.dll")]
+        public static extern bool GetCursorPos(out POINT lpPoint);
     }
 }
